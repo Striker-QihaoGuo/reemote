@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Kim Jarvis.
 # SPDX-License-Identifier: EPL-2.0
 
-"""Tests for the postgresql module: the fourteen ``Postgresql*`` facts and
+"""Tests for the postgresql module: the fifteen ``Postgresql*`` facts and
 the ``database``/``role``/``sql``/``dump``/``load``/``privilege``/
 ``membership``/``schema``/``extension``/``index``/``setting``/
 ``tablespace``/``publication``/``subscription`` operations.
@@ -11,7 +11,7 @@ Covers ``reemote.modules.postgresql.postgresql``. ``PostgresqlRoles`` and
 ``PostgresDatabases``, so their real-transport parity reuses the baseline's own
 fact fixtures verbatim (canned ``psql -Ac`` output plus the name-keyed
 result), including the custom-connection command render (minus the
-``PGPASSWORD`` prefix the namespace deliberately drops). The twelve
+``PGPASSWORD`` prefix the namespace deliberately drops). The thirteen
 reemote-original facts have no upstream fixture, so they are exercised
 with realistic canned ``psql -Ac`` output plus their parsing edge cases
 (empty output, the ``(N rows)`` trailer, t/f bool coercion, the
@@ -51,6 +51,8 @@ from reemote.modules.postgresql.postgresql import (
     PostgresqlConnections,
     PostgresqlDatabaseCommand,
     PostgresqlDatabases,
+    PostgresqlDefaultPrivilegeCommand,
+    PostgresqlDefaultPrivileges,
     PostgresqlDumpCommand,
     PostgresqlExtensionCommand,
     PostgresqlExtensions,
@@ -516,6 +518,69 @@ async def test_indexes_seam_is_database_keyed():
     assert await PostgresqlIndexes.process(host) == []
 
 
+# --- PostgresqlDefaultPrivileges ---------------------------------------------
+
+
+DEFAULT_PRIVILEGES_OUTPUT = """\
+target_role|schema|object_class|grantee|privilege_type|is_grantable
+postgres||TABLES|alice|SELECT|f
+postgres|app|TABLES|bob|INSERT|t
+alice||SEQUENCES|PUBLIC|USAGE|f
+(3 rows)
+"""
+
+
+async def test_default_privileges_parses_canned_output():
+    host = CannedShellHost(DEFAULT_PRIVILEGES_OUTPUT)
+    assert await PostgresqlDefaultPrivileges.process(host) == [
+        {
+            "target_role": "postgres",
+            "schema": None,
+            "object_class": "TABLES",
+            "grantee": "alice",
+            "privilege": "SELECT",
+            "grantable": False,
+        },
+        {
+            "target_role": "postgres",
+            "schema": "app",
+            "object_class": "TABLES",
+            "grantee": "bob",
+            "privilege": "INSERT",
+            "grantable": True,
+        },
+        {
+            "target_role": "alice",
+            "schema": None,
+            "object_class": "SEQUENCES",
+            "grantee": "PUBLIC",
+            "privilege": "USAGE",
+            "grantable": False,
+        },
+    ]
+
+
+def test_default_privileges_parse_empty_output():
+    # No ALTER DEFAULT PRIVILEGES recorded: pg_default_acl is empty.
+    assert PostgresqlDefaultPrivileges.parse([]) == []
+
+
+async def test_default_privileges_seam_is_database_keyed():
+    entry = {
+        "target_role": "postgres",
+        "schema": None,
+        "object_class": "TABLES",
+        "grantee": "alice",
+        "privilege": "SELECT",
+        "grantable": False,
+    }
+    host = SimulatedHost(name="h", postgres_default_privileges={"mydb": [entry]})
+    assert await PostgresqlDefaultPrivileges.process(host, psql_database="mydb") == [
+        entry
+    ]
+    assert await PostgresqlDefaultPrivileges.process(host) == []
+
+
 # --- PostgresqlPrivileges ----------------------------------------------------
 
 
@@ -525,7 +590,8 @@ database||mydb|alice|CONNECT|f
 schema||public|PUBLIC|USAGE|f
 table|public|users|alice|SELECT|t
 table|public|users|bob|INSERT|f
-(4 rows)
+tablespace||fast|alice|CREATE|f
+(5 rows)
 """
 
 
@@ -562,6 +628,14 @@ async def test_privileges_parses_canned_output():
             "name": "users",
             "grantee": "bob",
             "privilege": "INSERT",
+            "grantable": False,
+        },
+        {
+            "object_type": "tablespace",
+            "schema": None,
+            "name": "fast",
+            "grantee": "alice",
+            "privilege": "CREATE",
             "grantable": False,
         },
     ]
@@ -1061,7 +1135,7 @@ FAST_SPACE = {"oid": 16385, "name": "fast", "owner": "postgres", "location": "/m
 
 def test_postgresql_namespace_exports_operations_and_descriptors():
     # The fourteen operations are reached through the namespace and the
-    # package, never the top level; the fourteen descriptors are
+    # package, never the top level; the fifteen descriptors are
     # re-exported at all three sites like every other descriptor.
     for name in (
         "database",
@@ -1083,6 +1157,7 @@ def test_postgresql_namespace_exports_operations_and_descriptors():
         assert not hasattr(reemote, name)
     for name in (
         "PostgresqlDatabaseCommand",
+        "PostgresqlDefaultPrivilegeCommand",
         "PostgresqlDumpCommand",
         "PostgresqlExtensionCommand",
         "PostgresqlIndexCommand",
@@ -2109,6 +2184,513 @@ async def test_privilege_seam_grant_upgrade_and_revoke():
         ),
     )
     assert host.postgres_privileges == {"postgres": []}
+
+
+# --- privilege operation: issue-29 parity extensions -------------------------
+
+
+def _default_grant_entry(
+    privilege: str,
+    *,
+    target_role: str = "postgres",
+    schema: str | None = None,
+    object_class: str = "TABLES",
+    grantee: str = "alice",
+    grantable: bool = False,
+) -> dict:
+    """One PostgresqlDefaultPrivileges entry (the pg_default_acl row shape)."""
+    return {
+        "target_role": target_role,
+        "schema": schema,
+        "object_class": object_class,
+        "grantee": grantee,
+        "privilege": privilege,
+        "grantable": grantable,
+    }
+
+
+def test_privilege_command_renders_tablespace_and_session_role():
+    assert PostgresqlPrivilegeCommand(
+        privileges=("CREATE",), role="alice", object_type="tablespace",
+        objects=("fast",),
+    ).shell() == "psql -Ac 'GRANT CREATE ON TABLESPACE \"fast\" TO \"alice\"'"
+    # session_role prefixes SET ROLE inside the same psql invocation, on
+    # both the grant and the revoke direction.
+    assert PostgresqlPrivilegeCommand(
+        privileges=("SELECT",), role="alice", objects=("public.users",),
+        session_role="owner_role",
+    ).shell() == (
+        "psql -Ac 'SET ROLE \"owner_role\"; "
+        "GRANT SELECT ON TABLE \"public\".\"users\" TO \"alice\"'"
+    )
+    assert PostgresqlPrivilegeCommand(
+        privileges=("SELECT",), role="alice", objects=("public.users",),
+        present=False, session_role="owner_role",
+    ).shell() == (
+        "psql -Ac 'SET ROLE \"owner_role\"; "
+        "REVOKE SELECT ON TABLE \"public\".\"users\" FROM \"alice\"'"
+    )
+
+
+def test_default_privilege_command_renders_all_forms():
+    assert PostgresqlDefaultPrivilegeCommand(
+        privileges=("SELECT",), role="alice"
+    ).shell() == (
+        "psql -Ac 'ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO \"alice\"'"
+    )
+    assert PostgresqlDefaultPrivilegeCommand(
+        privileges=("SELECT", "INSERT"), role="alice",
+        target_role="app_owner", schema="app", grant_option=True,
+    ).shell() == (
+        "psql -Ac 'ALTER DEFAULT PRIVILEGES FOR ROLE \"app_owner\" "
+        "IN SCHEMA \"app\" GRANT SELECT, INSERT ON TABLES TO \"alice\" "
+        "WITH GRANT OPTION'"
+    )
+    assert PostgresqlDefaultPrivilegeCommand(
+        privileges=("USAGE",), role="alice", object_class="SEQUENCES",
+        target_role="app_owner", present=False,
+    ).shell() == (
+        "psql -Ac 'ALTER DEFAULT PRIVILEGES FOR ROLE \"app_owner\" "
+        "REVOKE USAGE ON SEQUENCES FROM \"alice\"'"
+    )
+    assert PostgresqlDefaultPrivilegeCommand(
+        privileges=("SELECT",), role="alice", present=False,
+        revoke_grant_option=True, session_role="owner_role",
+    ).shell() == (
+        "psql -Ac 'SET ROLE \"owner_role\"; ALTER DEFAULT PRIVILEGES "
+        "REVOKE GRANT OPTION FOR SELECT ON TABLES FROM \"alice\"'"
+    )
+
+
+async def test_privilege_tablespace_grant_is_never_schema_qualified():
+    host = SimulatedHost(name="h")
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="CREATE",
+        role="alice",
+        object_type="tablespace",
+        objects=["fast"],
+    )
+    assert ctx.changed
+    assert commands == [
+        PostgresqlPrivilegeCommand(
+            privileges=("CREATE",), role="alice", object_type="tablespace",
+            objects=("fast",),
+        )
+    ]
+    # A held tablespace grant (the fact's new spcacl arm) reads as no-op.
+    host = SimulatedHost(
+        name="h",
+        postgres_privileges={
+            "postgres": [
+                _grant_entry(
+                    "CREATE", name="fast", schema=None, object_type="tablespace"
+                )
+            ]
+        },
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="CREATE",
+        role="alice",
+        object_type="tablespace",
+        objects=["fast"],
+    )
+    assert not ctx.changed
+    assert commands == []
+
+
+async def test_privilege_tablespace_rejects_all_in_schema():
+    host = SimulatedHost(name="h")
+    with pytest.raises(
+        ValueError, match="tablespaces cannot be addressed ALL IN SCHEMA"
+    ):
+        await materialize(
+            host,
+            postgresql.privilege,
+            privileges="CREATE",
+            role="alice",
+            object_type="tablespace",
+            all_in_schema="public",
+        )
+
+
+async def test_privilege_multiple_grantees_reconcile_independently():
+    # Ansible's roles plural: alice already holds SELECT, bob does not --
+    # only bob's grant is yielded, and the reason reports both grantees.
+    host = SimulatedHost(
+        name="h", postgres_privileges={"postgres": [_grant_entry("SELECT")]}
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role=["bob", "alice"],
+        objects=["users"],
+    )
+    assert ctx.changed
+    assert ctx.reason == (
+        "postgresql role alice already has the privileges; "
+        "postgresql will grant SELECT to bob"
+    )
+    assert commands == [
+        PostgresqlPrivilegeCommand(
+            privileges=("SELECT",), role="bob", objects=("public.users",)
+        )
+    ]
+
+
+async def test_privilege_multiple_grantees_noop_when_all_hold():
+    host = SimulatedHost(
+        name="h",
+        postgres_privileges={
+            "postgres": [
+                _grant_entry("SELECT"),
+                _grant_entry("SELECT", grantee="bob"),
+            ]
+        },
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role=["alice", "bob"],
+        objects=["users"],
+    )
+    assert not ctx.changed
+    assert ctx.reason == (
+        "postgresql role alice already has the privileges; "
+        "postgresql role bob already has the privileges"
+    )
+    assert commands == []
+
+
+async def test_privilege_rejects_an_empty_grantee_list():
+    host = SimulatedHost(name="h")
+    with pytest.raises(
+        ValueError, match="requires at least one grantee role"
+    ):
+        await materialize(
+            host,
+            postgresql.privilege,
+            privileges="SELECT",
+            role=[],
+            objects=["users"],
+        )
+
+
+async def test_privilege_target_roles_rejected_outside_default_privs():
+    host = SimulatedHost(name="h")
+    with pytest.raises(
+        ValueError, match="target_roles is only valid for object_type default_privs"
+    ):
+        await materialize(
+            host,
+            postgresql.privilege,
+            privileges="SELECT",
+            role="alice",
+            objects=["users"],
+            target_roles="app_owner",
+        )
+
+
+async def test_privilege_session_role_rides_the_command():
+    host = SimulatedHost(name="h")
+    _ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role="alice",
+        objects=["users"],
+        session_role="owner_role",
+    )
+    assert commands == [
+        PostgresqlPrivilegeCommand(
+            privileges=("SELECT",), role="alice", objects=("public.users",),
+            session_role="owner_role",
+        )
+    ]
+
+
+async def test_default_privs_grants_missing_defaults_for_the_connecting_role():
+    # No target_roles: the connecting role (psql_user, or postgres when
+    # unset) is targeted explicitly, so the SQL and the fact comparison
+    # address the same role. objects defaults to the TABLES class.
+    host = SimulatedHost(name="h")
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role="alice",
+        object_type="default_privs",
+    )
+    assert ctx.changed
+    assert ctx.reason == "postgresql will grant SELECT on default tables to alice"
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres"
+        )
+    ]
+
+
+async def test_default_privs_noop_when_held():
+    host = SimulatedHost(
+        name="h",
+        postgres_default_privileges={"postgres": [_default_grant_entry("SELECT")]},
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="select",
+        role="alice",
+        object_type="default_privs",
+        objects=["tables"],
+    )
+    assert not ctx.changed
+    assert ctx.reason == (
+        "postgresql role alice already has the default tables privileges"
+    )
+    assert commands == []
+
+
+async def test_default_privs_target_roles_and_schema_scope_the_default():
+    # FOR ROLE + IN SCHEMA: a default held for another target role or
+    # another schema does not count, and one command per target role is
+    # yielded for the named pair.
+    host = SimulatedHost(
+        name="h",
+        postgres_default_privileges={
+            "postgres": [
+                _default_grant_entry("SELECT", target_role="someone_else"),
+                _default_grant_entry("SELECT", schema="other"),
+            ]
+        },
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role="alice",
+        object_type="default_privs",
+        objects=["tables"],
+        all_in_schema="app",
+        target_roles=["app_owner", "report_owner"],
+    )
+    assert ctx.changed
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", schema="app",
+            target_role="app_owner",
+        ),
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", schema="app",
+            target_role="report_owner",
+        ),
+    ]
+
+
+async def test_default_privs_rejects_an_unknown_object_class():
+    host = SimulatedHost(name="h")
+    with pytest.raises(
+        ValueError, match="unknown default_privs object class 'widgets'"
+    ):
+        await materialize(
+            host,
+            postgresql.privilege,
+            privileges="SELECT",
+            role="alice",
+            object_type="default_privs",
+            objects=["widgets"],
+        )
+
+
+async def test_default_privs_rejects_privileges_invalid_for_the_class():
+    # EXECUTE passes the top-level default_privs union but is not valid
+    # on the TABLES class -- the per-class check rejects it.
+    host = SimulatedHost(name="h")
+    with pytest.raises(
+        ValueError, match="privileges EXECUTE are not valid on default tables"
+    ):
+        await materialize(
+            host,
+            postgresql.privilege,
+            privileges="EXECUTE",
+            role="alice",
+            object_type="default_privs",
+            objects=["tables"],
+        )
+
+
+async def test_default_privs_all_expands_per_class():
+    host = SimulatedHost(name="h")
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="ALL",
+        role="alice",
+        object_type="default_privs",
+        objects=["functions", "sequences"],
+    )
+    assert ctx.changed
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("EXECUTE",), role="alice", object_class="FUNCTIONS",
+            target_role="postgres",
+        ),
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT", "UPDATE", "USAGE"), role="alice",
+            object_class="SEQUENCES", target_role="postgres",
+        ),
+    ]
+
+
+async def test_default_privs_revokes_only_the_held_defaults():
+    host = SimulatedHost(
+        name="h",
+        postgres_default_privileges={"postgres": [_default_grant_entry("SELECT")]},
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges=["SELECT", "INSERT"],
+        role="alice",
+        object_type="default_privs",
+        present=False,
+    )
+    assert ctx.changed
+    assert ctx.reason == (
+        "postgresql will revoke SELECT on default tables from alice"
+    )
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres",
+            present=False,
+        )
+    ]
+
+
+async def test_default_privs_grant_option_upgrade_and_withdrawal():
+    # Held plain: a grant_option request re-grants WITH GRANT OPTION.
+    host = SimulatedHost(
+        name="h",
+        postgres_default_privileges={"postgres": [_default_grant_entry("SELECT")]},
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role="alice",
+        object_type="default_privs",
+        grant_option=True,
+    )
+    assert ctx.changed
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres",
+            grant_option=True,
+        )
+    ]
+    # Held grantable: a revoke with grant_option withdraws only the option.
+    host = SimulatedHost(
+        name="h",
+        postgres_default_privileges={
+            "postgres": [_default_grant_entry("SELECT", grantable=True)]
+        },
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role="alice",
+        object_type="default_privs",
+        present=False,
+        grant_option=True,
+    )
+    assert ctx.changed
+    assert ctx.reason == (
+        "postgresql will revoke grant option for SELECT on default tables "
+        "from alice"
+    )
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres",
+            present=False, revoke_grant_option=True,
+        )
+    ]
+
+
+async def test_default_privs_multiple_grantees_reconcile_independently():
+    host = SimulatedHost(
+        name="h",
+        postgres_default_privileges={"postgres": [_default_grant_entry("SELECT")]},
+    )
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role=["alice", "bob"],
+        object_type="default_privs",
+    )
+    assert ctx.changed
+    assert commands == [
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="bob", target_role="postgres"
+        )
+    ]
+
+
+async def test_default_privs_seam_grant_upgrade_and_revoke():
+    # send_command maintains postgres_default_privileges: a grant upserts
+    # one entry per privilege, a re-grant ORs the grant option in, REVOKE
+    # GRANT OPTION FOR only clears grantable, a plain revoke removes --
+    # and a repeat materialize against the mutated seam is a no-op.
+    host = SimulatedHost(name="h")
+    await send_command(
+        host,
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres"
+        ),
+    )
+    assert host.postgres_default_privileges == {
+        "postgres": [_default_grant_entry("SELECT")]
+    }
+    ctx, commands = await materialize(
+        host,
+        postgresql.privilege,
+        privileges="SELECT",
+        role="alice",
+        object_type="default_privs",
+    )
+    assert not ctx.changed
+    assert commands == []
+    await send_command(
+        host,
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres",
+            grant_option=True,
+        ),
+    )
+    assert host.postgres_default_privileges["postgres"][0]["grantable"] is True
+    await send_command(
+        host,
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres",
+            present=False, revoke_grant_option=True,
+        ),
+    )
+    assert host.postgres_default_privileges == {
+        "postgres": [_default_grant_entry("SELECT")]
+    }
+    await send_command(
+        host,
+        PostgresqlDefaultPrivilegeCommand(
+            privileges=("SELECT",), role="alice", target_role="postgres",
+            present=False,
+        ),
+    )
+    assert host.postgres_default_privileges == {"postgres": []}
 
 
 # --- membership operation (reemote-original) --------------------------------
