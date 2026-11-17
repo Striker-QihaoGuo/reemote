@@ -1852,6 +1852,193 @@ def test_dnf_package_commands_quote_odd_disable_repo_ids():
     assert quoted in remove.shell()
 
 
+async def test_dnf_packages_exclude_renders_on_install():
+    """``exclude`` is a first-class transaction filter: it renders one
+    ``--exclude=<pkg>`` per name on the install, so dnf never pulls an
+    excluded name as a dependency side effect -- Ansible's ``yum: exclude=``
+    (the postgresql role's ``exclude: python-unversioned-command``) rather
+    than an ``extra_install_args`` string."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in dnf.packages(
+            ctx,
+            packages=("postgresql-server",),
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands == [
+        DnfInstallCommand(
+            packages=("postgresql-server",),
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands[0].shell() == (
+        "dnf install -y --exclude=python-unversioned-command postgresql-server"
+    )
+
+
+async def test_dnf_packages_exclude_renders_on_downgrade():
+    """The filter also rides the downgrade descriptor ``allow_downgrade``
+    routes a mismatched pin to, in the same slot as the repo scopes."""
+    host = SimulatedHost(name="h", packages={"nginx": ["1.24.0"]})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in dnf.packages(
+            ctx,
+            packages=("nginx=1.23.0",),
+            allow_downgrade=True,
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands == [
+        DnfDowngradeCommand(
+            packages=("nginx=1.23.0",),
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands[0].shell() == (
+        "dnf downgrade -y --allowerasing "
+        "--exclude=python-unversioned-command nginx-1.23.0"
+    )
+
+
+async def test_dnf_packages_exclude_renders_on_update_and_latest_upgrades():
+    """``exclude`` rides both update shapes: the bare ``update=True`` full
+    system upgrade and the ``latest`` per-package upgrades (Ansible scopes
+    exclude to updates and installs)."""
+    host = SimulatedHost(name="h", packages={"nginx": ["1.24.0"]})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in dnf.packages(
+            ctx,
+            packages=("nginx", "vim"),
+            update=True,
+            latest=True,
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands == [
+        DnfUpdateCommand(exclude=("python-unversioned-command",)),
+        DnfInstallCommand(
+            packages=("vim",), exclude=("python-unversioned-command",)
+        ),
+        DnfUpdateCommand(
+            packages=("nginx",), exclude=("python-unversioned-command",)
+        ),
+    ]
+    assert commands[0].shell() == (
+        "dnf update -y --exclude=python-unversioned-command"
+    )
+    assert commands[2].shell() == (
+        "dnf update -y --exclude=python-unversioned-command nginx"
+    )
+
+
+async def test_dnf_packages_exclude_not_rendered_on_remove_or_makecache():
+    """The filter does not ride the remove (Ansible scopes exclude to
+    updates and installs) nor the ``update_cache`` makecache (metadata is
+    refreshed for every package, unlike the repo scopes it does not
+    inherit)."""
+    host = SimulatedHost(name="h", packages={"nginx": [""]})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in dnf.packages(
+            ctx,
+            packages=("nginx",),
+            present=False,
+            update_cache=True,
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands == [
+        DnfMakecacheCommand(),
+        DnfRemoveCommand(packages=("nginx",)),
+    ]
+    assert commands[0].shell() == "dnf -y makecache"
+    assert commands[1].shell() == "dnf remove -y nginx"
+
+
+async def test_dnf_packages_exclude_slots_in_after_the_repo_scopes():
+    """The filter combines with ``nobest``/``extra_install_args`` and the
+    repo scopes, rendering after them and before the package names."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in dnf.packages(
+            ctx,
+            packages=("nginx",),
+            nobest=True,
+            extra_install_args="--skip-broken",
+            repos=("datadog",),
+            disable_repos=("appstream",),
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands[0].shell() == (
+        "dnf install -y --nobest --skip-broken "
+        "'--disablerepo=*' --enablerepo=datadog --disablerepo=appstream "
+        "--exclude=python-unversioned-command nginx"
+    )
+
+
+async def test_dnf_packages_normalizes_str_and_list_exclude():
+    """A bare string becomes a one-tuple and a list a tuple, mirroring the
+    ``repos``/``disable_repos`` normalization shape."""
+    host = SimulatedHost(name="h")
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    (from_str,) = [
+        c
+        async for c in dnf.packages(
+            ctx, packages=("nginx",), exclude="python-unversioned-command"
+        )
+    ]
+    (from_list,) = [
+        c
+        async for c in dnf.packages(ctx, packages=("nginx",), exclude=["a", "b"])
+    ]
+    assert from_str.exclude == ("python-unversioned-command",)
+    assert from_list.exclude == ("a", "b")
+    assert from_list.shell() == "dnf install -y --exclude=a --exclude=b nginx"
+
+
+def test_dnf_package_commands_quote_odd_exclude_names():
+    """An exclude name with shell metacharacters (dnf allows globs) rides
+    shlex.quote whole on the install, downgrade and update descriptors, so
+    the remote shell never globs the *."""
+    name = "python-*"
+    quoted = shlex.quote(f"--exclude={name}")
+    install = DnfInstallCommand(packages=("nginx",), exclude=(name,))
+    downgrade = DnfDowngradeCommand(packages=("nginx",), exclude=(name,))
+    update = DnfUpdateCommand(exclude=(name,))
+    assert install.shell().endswith(f"{quoted} nginx")
+    assert downgrade.shell().endswith(f"{quoted} nginx")
+    assert update.shell().endswith(quoted)
+
+
+async def test_dnf_packages_exclude_does_not_force_a_change_when_present():
+    """``exclude`` is command-scoping only: presence stays fact-based, so
+    an already-installed package with ``exclude`` set is still a no-op."""
+    host = SimulatedHost(name="h", packages={"nginx": ["1.24.0"]})
+    ctx = OpContext(host=host, facts=FactCache(host, phase="prepare"))
+    commands = [
+        c
+        async for c in dnf.packages(
+            ctx,
+            packages=("nginx",),
+            exclude=("python-unversioned-command",),
+        )
+    ]
+    assert commands == []
+    assert not ctx.changed
+    assert ctx.reason == "all packages present"
+
+
 async def test_dnf_packages_update_cache_yields_makecache_before_install():
     """``update_cache=True`` yields a ``DnfMakecacheCommand`` ahead of the
     install work -- Ansible's ``update_cache: true`` spelling -- so the

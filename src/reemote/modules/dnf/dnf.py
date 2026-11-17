@@ -44,7 +44,10 @@
 # install/remove it yields, a first-class ``disable_repos`` (bare
 # ``--disablerepo=<id>`` per id, distinct from ``repos``' disable-all-then-
 # enable-named) so the ansible-datadog role's ``disablerepo: appstream`` does
-# not have to be smuggled through ``extra_install_args``, and an
+# not have to be smuggled through ``extra_install_args``, a first-class
+# ``exclude`` (one ``--exclude=<pkg>`` per name on the install/downgrade/
+# update transactions -- Ansible's ``yum: exclude=``, the postgresql role's
+# ``exclude: python-unversioned-command``), and an
 # ``update_cache`` flag that yields a scoped ``DnfMakecacheCommand`` ahead of
 # the install/remove work -- the role's ``update_cache: true`` -- so a
 # metadata refresh is first-class rather than a separate ``dnf.makecache``
@@ -1205,9 +1208,10 @@ def _repo_scope_args(
 
 
 def _normalize_repos(repos: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
-    """Normalize a repos argument: a bare string becomes a one-tuple, None an
-    empty tuple (every repo), anything else a tuple -- the ``dnf.packages``
-    normalization shape."""
+    """Normalize a repos-shaped argument: a bare string becomes a one-tuple,
+    None an empty tuple, anything else a tuple -- the ``dnf.packages``
+    normalization shape shared by ``repos``, ``disable_repos`` and
+    ``exclude``."""
     if repos is None:
         return ()
     if isinstance(repos, str):
@@ -1222,6 +1226,7 @@ class DnfInstallCommand(Command):
     extra_args: str | None = None
     repos: tuple[str, ...] = ()
     disable_repos: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
 
     def shell(self) -> str:
         parts = ["dnf", "install", "-y"]
@@ -1232,6 +1237,7 @@ class DnfInstallCommand(Command):
         scope = _repo_scope_args(self.repos, self.disable_repos).strip()
         if scope:
             parts.append(scope)
+        parts.extend(shlex.quote(f"--exclude={pkg}") for pkg in self.exclude)
         parts.extend(shlex.quote(_dnf_package_spec(package)) for package in self.packages)
         return " ".join(parts)
 
@@ -1258,6 +1264,7 @@ class DnfDowngradeCommand(Command):
     extra_args: str | None = None
     repos: tuple[str, ...] = ()
     disable_repos: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
 
     def shell(self) -> str:
         parts = ["dnf", "downgrade", "-y", "--allowerasing"]
@@ -1268,6 +1275,7 @@ class DnfDowngradeCommand(Command):
         scope = _repo_scope_args(self.repos, self.disable_repos).strip()
         if scope:
             parts.append(scope)
+        parts.extend(shlex.quote(f"--exclude={pkg}") for pkg in self.exclude)
         parts.extend(shlex.quote(_dnf_package_spec(package)) for package in self.packages)
         return " ".join(parts)
 
@@ -1294,12 +1302,17 @@ class DnfRemoveCommand(Command):
 class DnfUpdateCommand(Command):
     """``dnf update``: all packages when bare, just ``packages`` when given
     (the ``latest`` upgrade path). The bare form is what both ``dnf.update``
-    and ``dnf.packages(update=True)`` yield."""
+    and ``dnf.packages(update=True)`` yield. ``exclude`` renders one
+    ``--exclude=<pkg>`` per name ahead of the package list; only
+    ``dnf.packages`` sets it (the standalone ``dnf.update`` does not expose
+    it)."""
 
     packages: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
 
     def shell(self) -> str:
         parts = ["dnf", "update", "-y"]
+        parts.extend(shlex.quote(f"--exclude={pkg}") for pkg in self.exclude)
         parts.extend(shlex.quote(package) for package in self.packages)
         return " ".join(parts)
 
@@ -1331,6 +1344,7 @@ async def packages(
     extra_uninstall_args: str | None = None,
     repos: str | list[str] | tuple[str, ...] | None = None,
     disable_repos: str | list[str] | tuple[str, ...] | None = None,
+    exclude: str | list[str] | tuple[str, ...] | None = None,
     **kwargs: Any,
 ) -> AsyncGenerator[Command]:
     """Install/remove/update dnf packages.
@@ -1394,6 +1408,23 @@ async def packages(
             appearing in both ends up disabled. Prefer tuples when building
             requests via ``op()``, since ``OperationRequest`` kwargs must
             stay hashable. Defaults to None (no repo disabled).
+        exclude (str | list[str] | tuple[str, ...] | None, optional): Package
+            names (globs allowed, dnf's own syntax) to exclude from the
+            install/downgrade/update transactions this operation yields --
+            one ``--exclude=<pkg>`` per name, so dnf never pulls an excluded
+            name as a dependency side effect. Ansible's ``yum: exclude=``
+            spelling (the postgresql role's ``exclude:
+            python-unversioned-command``) and a first-class alternative to
+            smuggling ``--exclude=<pkg>`` through ``extra_install_args``.
+            Rides the ``update=True`` full upgrade and the ``latest``
+            per-package upgrades too, but not the remove (Ansible scopes
+            exclude to updates and installs) and not the ``update_cache``
+            makecache (metadata is refreshed for every package).
+            Command-scoping only: presence stays fact-based, so an
+            already-installed package is never reinstalled just because
+            ``exclude`` is set. Prefer tuples when building requests via
+            ``op()``, since ``OperationRequest`` kwargs must stay hashable.
+            Defaults to None (nothing excluded).
         **kwargs: Additional keyword arguments.
 
     Yields:
@@ -1437,9 +1468,14 @@ async def packages(
     # ``disablerepo: appstream`` -- "every repo except this one" -- is
     # first-class rather than smuggled through ``extra_install_args``; it
     # also threads into the ``update_cache`` makecache so the refresh skips
-    # the same repos the transaction does. ``kwargs`` absorbs any further
-    # keyword arguments (any further global arguments are meta-parameters
-    # handled by ``op()`` here).
+    # the same repos the transaction does. ``exclude`` is the transaction
+    # filter (one ``--exclude=<pkg>`` per name, Ansible's ``yum: exclude=``):
+    # it rides the install/downgrade/update commands -- including the
+    # ``update=True`` full upgrade and the ``latest`` upgrades -- but not the
+    # remove or the makecache, and like the repo scopes it is command-scoping
+    # only, never forcing a change on an already-present package. ``kwargs``
+    # absorbs any further keyword arguments (any further global arguments
+    # are meta-parameters handled by ``op()`` here).
     reasons: list[str] = []
 
     if clean:
@@ -1453,6 +1489,7 @@ async def packages(
     # upgrade sees fresh metadata too.
     scoped = _normalize_repos(repos)
     scoped_disable = _normalize_repos(disable_repos)
+    excluded = _normalize_repos(exclude)
     if update_cache:
         ctx.changed = True
         reasons.append("dnf makecache")
@@ -1461,7 +1498,7 @@ async def packages(
     if update:
         ctx.changed = True
         reasons.append("dnf update")
-        yield DnfUpdateCommand()
+        yield DnfUpdateCommand(exclude=excluded)
 
     # Normalize: accept a bare string, a list, or None.
     if packages is None:
@@ -1523,6 +1560,7 @@ async def packages(
                         extra_args=extra_install_args,
                         repos=scoped,
                         disable_repos=scoped_disable,
+                        exclude=excluded,
                     )
                 if to_downgrade:
                     reasons.append(f"{len(to_downgrade)} package(s) to downgrade")
@@ -1532,11 +1570,12 @@ async def packages(
                         extra_args=extra_install_args,
                         repos=scoped,
                         disable_repos=scoped_disable,
+                        exclude=excluded,
                     )
             if to_upgrade:
                 ctx.changed = True
                 reasons.append(f"{len(to_upgrade)} package(s) to upgrade")
-                yield DnfUpdateCommand(packages=to_upgrade)
+                yield DnfUpdateCommand(packages=to_upgrade, exclude=excluded)
             if not to_install and not to_upgrade:
                 reasons.append("all packages present")
         else:

@@ -55,6 +55,12 @@ scoping so the refresh and the install agree on which repos are in play.
 This example leaves all three unset: httpd resolves from CentOS's default
 repos and the base image's cache is fresh.
 
+``exclude=(<pkg>, ...)`` renders one ``--exclude=<pkg>`` per name on the
+install/downgrade/update transactions -- Ansible's ``yum: exclude=`` (the
+postgresql role's ``exclude: python-unversioned-command``) -- keeping the
+named packages out of dnf's dependency resolution; this example leaves it
+unset too, since httpd pulls nothing worth excluding.
+
 Every request carries ``when=is_centos``, the declarative eligibility guard
 (see ``examples/demonstrations/composition/composed_when_guard.py``). The
 predicate reads only **static** inventory data -- ``host.group``, set by the
