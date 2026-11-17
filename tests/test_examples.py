@@ -29,6 +29,7 @@ because they can be executed without touching the demo hosts at all.
 
 import ast
 import importlib.util
+import io
 import pathlib
 import subprocess
 import sys
@@ -405,6 +406,30 @@ SNAPSHOT_ARGS = {
         "build_profile",
     ): lambda name: {
         name: {"profile_content": "export PATH=$PATH:/root/.composer/vendor/bin\n"}
+    },
+    # The EPEL repo role migration: two factories. build_install closes over
+    # the frozen plan whose repo_exists=False shape drains the key import, the
+    # RPM staging download, the install and the spool cleanup; the key stream
+    # is the io.BytesIO main() builds once from the control-side fetch.
+    # build_configure closes over the enabled-toggle plan (ini_option + the
+    # mode-convergence file request).
+    (
+        "examples/roles/ansible-role-repo-epel/ansible-role-repo-epel.py",
+        "build_install",
+    ): lambda name: {
+        name: {
+            "repo_exists": False,
+            "key_stream": io.BytesIO(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n"),
+            "keyid": "3228467c",
+            "rpm_url": "https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm",
+            "rpm_spool": "/tmp/epel-release-latest-9.noarch.rpm",
+        }
+    },
+    (
+        "examples/roles/ansible-role-repo-epel/ansible-role-repo-epel.py",
+        "build_configure",
+    ): lambda name: {
+        name: {"repofile": "/etc/yum.repos.d/epel.repo", "enabled": "1"}
     },
 }
 

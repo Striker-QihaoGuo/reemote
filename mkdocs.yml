@@ -181,5 +181,6 @@ nav:
           - ansible-role-php-xdebug: examples/roles/ansible-role-php-xdebug.md
           - ansible-role-drush: examples/roles/ansible-role-drush.md
           - ansible-role-composer: examples/roles/ansible-role-composer.md
+          - ansible-role-repo-epel: examples/roles/ansible-role-repo-epel.md
 
 

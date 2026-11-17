@@ -2123,10 +2123,11 @@ async def rpm(
     #
     # A URL ``src`` -- downloading a remote ``.rpm`` mid-deploy -- is
     # deliberately dropped: ``dnf.rpm`` installs a *binary* package file that
-    # must already be on the host, and reemote's URL download (``files.download``)
-    # is text-only, so a ``src`` with a URL scheme raises ``ValueError``
-    # (mirroring ``dnf.repo``). Stage the ``.rpm`` control-side and ``files.put``
-    # it onto the host first. Because removal reads the package name from the file, a
+    # must already be on the host, so a ``src`` with a URL scheme raises
+    # ``ValueError`` (mirroring ``dnf.repo``). Stage a URL ``.rpm`` with
+    # ``files.download`` first -- it fetches control-side and installs a
+    # binary body intact (#23) -- then install from the staged path.
+    # Because removal reads the package name from the file, a
     # ``present=False`` request whose ``.rpm`` is absent from the host cannot
     # resolve a name and is a no-op -- the same limitation documented for
     # an un-downloaded URL source. ``**kwargs`` absorbs any further global
@@ -2134,8 +2135,8 @@ async def rpm(
     if urlparse(src).scheme:
         raise ValueError(
             "dnf.rpm does not support a URL src (it installs a binary .rpm "
-            "that must already be on the host; files.download is text-only); "
-            f"put the .rpm on the host first, got: {src}"
+            "that must already be on the host); stage it with files.download "
+            f"first, got: {src}"
         )
 
     info = await ctx.facts.get(RpmPackage, src)
