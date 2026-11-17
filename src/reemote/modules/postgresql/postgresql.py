@@ -46,6 +46,14 @@
 # ``~/.pgpass``; ``postgresql.subscription``'s ``connection`` DSN should
 # likewise reference a passfile/service rather than embed a password.
 #
+# Fact reads ride the login user first; a read the server denies
+# (``Peer authentication failed`` / ``no pg_hba.conf entry`` -- a
+# peer-auth ``pg_hba.conf`` admits only the matching OS user) is
+# re-read elevated with ``sudo`` (the ``_MysqlFact._run`` fallback
+# precedent), so the facts stay idempotent under the same peer
+# authentication the operations use. The run-as user and any password
+# come from the inventory ``privilege`` data, never from an operation.
+#
 # Every fact and operation accepts the connection keyword arguments
 # ``psql_user``/``psql_host``/``psql_port``/``psql_database`` (the
 # ``psql_*`` module arguments minus the password). For database-scoped
@@ -61,7 +69,7 @@ from typing import Any, TypedDict, cast
 
 from ...commands import Command
 from ...core import OpContext, OperationError
-from ...hosts import Host
+from ...hosts import CommandNotFoundError, Host
 
 
 def _psql_base(
@@ -196,6 +204,15 @@ def _parse_array(value: str | None) -> list[str]:
     return value.strip("{}").split(",")
 
 
+#: The psql client's authentication-rejection signatures ("FATAL:  Peer
+#: authentication failed for user \"postgres\"" over the unix socket,
+#: "FATAL:  no pg_hba.conf entry for host ..." over TCP). Matched
+#: case-insensitively on stderr -- the _MysqlFact._run idiom -- because
+#: a peer-auth pg_hba.conf admits only the matching OS user, never the
+#: SSH login user.
+_PEER_AUTH_MARKERS = ("peer authentication failed", "no pg_hba.conf entry")
+
+
 class _PostgresqlFact:
     """Shared transport plumbing for the psql-backed facts.
 
@@ -204,6 +221,15 @@ class _PostgresqlFact:
     fact body is just its seam read plus ``parse``. Never exported or
     rendered; every concrete fact keeps its own ``process`` classmethod
     choosing between the SimulatedHost seam and ``_gather``.
+
+    The real-transport read is two-tier (the ``_MysqlFact._run``
+    precedent): the query rides the login user first, and a read the
+    server denies -- a peer-auth ``pg_hba.conf`` admits only the
+    matching OS user -- is re-read elevated with ``sudo``, so the peer
+    authentication the operations ride keeps the facts idempotent
+    instead of parsing the denial as an empty cluster. The run-as user
+    and any password come from the inventory ``privilege`` data, never
+    from an operation.
     """
 
     PSQL: str
@@ -237,14 +263,29 @@ class _PostgresqlFact:
         psql_database: str | None = None,
     ) -> Any:
         # Real transport: run the query over asyncssh and parse stdout.
-        stdout = await host.run_shell(
-            cls.command(
-                psql_user=psql_user,
-                psql_host=psql_host,
-                psql_port=psql_port,
-                psql_database=psql_database,
-            )
+        # The raw result keeps the exit status and stderr a plain run_shell
+        # read hides: 127 stays CommandNotFoundError (a missing psql must
+        # never parse as an empty fact), and a peer-auth rejection
+        # triggers the elevated re-read.
+        shell = cls.command(
+            psql_user=psql_user,
+            psql_host=psql_host,
+            psql_port=psql_port,
+            psql_database=psql_database,
         )
+        result = await host.run_shell_result(shell)
+        if result.exit_status == 127:
+            raise CommandNotFoundError(
+                host.name, shell, result.exit_status, result.stderr
+            )
+        stderr = (result.stderr or "").lower()
+        if any(marker in stderr for marker in _PEER_AUTH_MARKERS):
+            # The login user cannot authenticate: re-read elevated, the
+            # _MysqlFact._run precedent. With privilege.sudo_user =
+            # "postgres" this reproduces become_user: postgres for reads.
+            stdout = await host.run_shell_privileged(shell, sudo=True)
+        else:
+            stdout = result.stdout or ""
         return cls.parse(stdout.splitlines())  # type: ignore[attr-defined]
 
 
@@ -283,6 +324,11 @@ class PostgresqlConnection(TypedDict):
 class PostgresqlConnections(_PostgresqlFact):
     """The server's client connections, without the query text.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -298,7 +344,7 @@ class PostgresqlConnections(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -396,6 +442,11 @@ class PostgresqlDatabase(TypedDict):
 class PostgresqlDatabases(_PostgresqlFact):
     """The cluster's databases and their metadata, keyed by database name.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -411,7 +462,7 @@ class PostgresqlDatabases(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -497,6 +548,11 @@ class PostgresqlExtension(TypedDict):
 class PostgresqlExtensions(_PostgresqlFact):
     """The extensions installed in a database, with versions and schemas.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -512,7 +568,7 @@ class PostgresqlExtensions(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -595,6 +651,11 @@ class PostgresqlIndex(TypedDict):
 class PostgresqlIndexes(_PostgresqlFact):
     """The user indexes in a database, with table, owner and access method.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -610,7 +671,7 @@ class PostgresqlIndexes(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -705,6 +766,11 @@ class PostgresqlPrivilege(TypedDict):
 class PostgresqlPrivileges(_PostgresqlFact):
     """The object-level privilege grants visible from a database.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -720,7 +786,7 @@ class PostgresqlPrivileges(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -828,6 +894,11 @@ class PostgresqlPublication(TypedDict):
 class PostgresqlPublications(_PostgresqlFact):
     """The logical-replication publications in a database, with their tables.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -843,7 +914,7 @@ class PostgresqlPublications(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -937,6 +1008,11 @@ class PostgresqlReplicationClient(TypedDict):
 class PostgresqlReplication(_PostgresqlFact):
     """The streaming-replication standbys connected to this server.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -952,7 +1028,7 @@ class PostgresqlReplication(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1029,6 +1105,11 @@ class PostgresqlRoleMembership(TypedDict):
 class PostgresqlRoleMemberships(_PostgresqlFact):
     """The role-to-role membership grants in the cluster.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1044,7 +1125,7 @@ class PostgresqlRoleMemberships(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1139,6 +1220,11 @@ class PostgresqlRole(TypedDict):
 class PostgresqlRoles(_PostgresqlFact):
     """The cluster's roles and their attributes, keyed by role name.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1154,7 +1240,7 @@ class PostgresqlRoles(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1240,6 +1326,11 @@ class PostgresqlSchema(TypedDict):
 class PostgresqlSchemas(_PostgresqlFact):
     """The non-system schemas in a database, with their owners.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1255,7 +1346,7 @@ class PostgresqlSchemas(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1333,6 +1424,11 @@ class PostgresqlSetting(TypedDict):
 class PostgresqlSettings(_PostgresqlFact):
     """The server's active configuration parameters (GUCs).
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1348,7 +1444,7 @@ class PostgresqlSettings(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1426,6 +1522,11 @@ class PostgresqlSubscription(TypedDict):
 class PostgresqlSubscriptions(_PostgresqlFact):
     """The logical-replication subscriptions in a database.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1441,7 +1542,7 @@ class PostgresqlSubscriptions(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1533,6 +1634,11 @@ class PostgresqlTable(TypedDict):
 class PostgresqlTables(_PostgresqlFact):
     """The user tables in a database, with owners and row estimates.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1548,7 +1654,7 @@ class PostgresqlTables(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -1634,6 +1740,11 @@ class PostgresqlTablespace(TypedDict):
 class PostgresqlTablespaces(_PostgresqlFact):
     """The cluster's tablespaces and their filesystem locations.
 
+    A read the server denies the login user (a peer-auth ``pg_hba.conf``
+    admits only the matching OS user) is re-read elevated with ``sudo``
+    -- the run-as user and any password come from the inventory
+    ``privilege`` data, never from an operation.
+
     **Commands:**
 
     ```bash
@@ -1649,7 +1760,7 @@ class PostgresqlTablespaces(_PostgresqlFact):
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -2171,7 +2282,7 @@ async def extension(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -2587,7 +2698,7 @@ async def membership(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -3243,7 +3354,7 @@ async def role(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:
@@ -3403,7 +3514,7 @@ async def schema(
     **Raises:**
 
     ```python
-    CommandNotFoundError, HostConnectionError
+    CommandError, CommandNotFoundError, HostConnectionError, PrivilegeError
     ```
 
     Examples:

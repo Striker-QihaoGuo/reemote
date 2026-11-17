@@ -21,9 +21,14 @@ Every fact also reads its ``SimulatedHost`` seam (cluster-wide entry
 lists / name-keyed dicts, or database-keyed entry lists for the
 database-scoped facts) with copy-on-read semantics, and the shared
 ``psql`` command renderer is checked for flag order and ``shlex`` quoting.
+The two-tier real-transport read (a peer-auth denied login-user read is
+re-read elevated with ``sudo``, the ``_MysqlFact._run`` precedent) is
+exercised with canned denial stderr and an elevated stdout.
 """
 
 import shlex
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -40,7 +45,7 @@ from reemote.drivers import (
     run_prepare,
     send_command,
 )
-from reemote.hosts import Host
+from reemote.hosts import CommandNotFoundError, Host
 from reemote.modules import postgresql
 from reemote.modules.postgresql.postgresql import (
     PostgresqlConnections,
@@ -82,16 +87,39 @@ from tests.simulated_host import SimulatedHost
 
 
 class CannedShellHost(Host):
-    """Returns fixed stdout from ``run_shell`` instead of connecting."""
+    """Answers the transport seam with canned results instead of connecting.
 
-    def __init__(self, stdout: str):
+    The login-user read answers ``stdout`` with ``exit_status``/``stderr``;
+    a ``sudo``-wrapped re-read answers ``elevated_stdout`` when one is set
+    (the peer-auth denied-read fallback shape).
+    """
+
+    def __init__(
+        self,
+        stdout: str,
+        *,
+        exit_status: int = 0,
+        stderr: str = "",
+        elevated_stdout: str | None = None,
+    ):
         super().__init__(name="canned")
         self._stdout = stdout
+        self._exit_status = exit_status
+        self._stderr = stderr
+        self._elevated_stdout = elevated_stdout
         self.shells: list[str] = []
 
-    async def run_shell(self, shell: str, *, check: bool = False) -> str:
+    async def _run_shell(self, shell: str) -> Any:
         self.shells.append(shell)
-        return self._stdout
+        if shell.startswith("sudo ") and self._elevated_stdout is not None:
+            return SimpleNamespace(
+                exit_status=0, stdout=self._elevated_stdout, stderr=""
+            )
+        return SimpleNamespace(
+            exit_status=self._exit_status,
+            stdout=self._stdout,
+            stderr=self._stderr,
+        )
 
 
 # --- shared helpers ----------------------------------------------------------
@@ -899,6 +927,102 @@ async def test_tablespaces_reads_the_simulated_seam():
     result[0]["location"] = "/elsewhere"
     assert host.postgres_tablespaces[0]["location"] == "/mnt/fast"
     assert await PostgresqlTablespaces.process(SimulatedHost(name="h")) == []
+
+
+# --- elevated fallback (peer-auth denied login-user reads) --------------------
+
+
+PEER_AUTH_STDERR = (
+    "psql: error: connection to server on socket "
+    '"/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  Peer authentication '
+    'failed for user "postgres"'
+)
+
+NO_HBA_STDERR = (
+    'psql: error: connection to server at "127.0.0.1", port 5432 failed: '
+    'FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "supervisor", '
+    'database "postgres", no encryption'
+)
+
+
+async def test_roles_peer_auth_read_rereads_elevated():
+    # The geerlingguy.postgresql shape: peer auth denies the login user
+    # (empty stdout), so the fact re-reads elevated -- the _MysqlFact._run
+    # precedent -- and parses the sudo read instead of an empty cluster.
+    host = CannedShellHost(
+        "", exit_status=2, stderr=PEER_AUTH_STDERR, elevated_stdout=ROLES_OUTPUT
+    )
+    assert await PostgresqlRoles.process(host) == ROLES_FACT
+    assert host.shells == [
+        "psql -Ac 'SELECT * FROM pg_catalog.pg_roles'",
+        "sudo psql -Ac 'SELECT * FROM pg_catalog.pg_roles'",
+    ]
+
+
+async def test_databases_no_hba_entry_read_rereads_elevated():
+    # The TCP shape: no pg_hba.conf entry for the login user triggers the
+    # same elevated re-read, connection flags intact on both tiers.
+    host = CannedShellHost(
+        "", exit_status=2, stderr=NO_HBA_STDERR, elevated_stdout=DATABASES_OUTPUT
+    )
+    assert (
+        await PostgresqlDatabases.process(host, psql_host="127.0.0.1")
+        == DATABASES_FACT
+    )
+    shell = PostgresqlDatabases.command(psql_host="127.0.0.1")
+    assert host.shells == [shell, f"sudo {shell}"]
+
+
+async def test_roles_missing_client_raises_without_elevation():
+    # Exit 127 stays CommandNotFoundError: a missing psql must never
+    # parse as an empty fact, and elevating cannot install it.
+    host = CannedShellHost("", exit_status=127, stderr="sh: psql: not found")
+    with pytest.raises(CommandNotFoundError):
+        await PostgresqlRoles.process(host)
+    assert host.shells == ["psql -Ac 'SELECT * FROM pg_catalog.pg_roles'"]
+
+
+async def test_tables_statement_error_does_not_elevate():
+    # A non-auth failure keeps the tolerant empty parse: the fallback is
+    # for denied reads only, so a host without sudo is never asked.
+    host = CannedShellHost(
+        "", exit_status=1, stderr='psql: error: FATAL:  database "nope" does not exist'
+    )
+    assert await PostgresqlTables.process(host, psql_database="nope") == []
+    assert host.shells == [PostgresqlTables.command(psql_database="nope")]
+
+
+async def test_database_noop_when_elevated_read_sees_existing_database():
+    # The reported failure: the database already exists, the login-user
+    # read is peer-auth denied, and a blind fact would plan a CREATE that
+    # dies server-side. The elevated fallback sees it, so the operation
+    # no-ops.
+    host = CannedShellHost(
+        "", exit_status=2, stderr=PEER_AUTH_STDERR, elevated_stdout=DATABASES_OUTPUT
+    )
+    ctx, commands = await materialize(
+        host, postgresql.database, database="baseline_stuff"
+    )
+    assert not ctx.changed
+    assert commands == []
+    assert ctx.reason == (
+        "postgresql database baseline_stuff already exists with the same parameters"
+    )
+
+
+async def test_database_creates_when_elevated_read_lacks_database():
+    # The fallback cuts both ways: a database the elevated read does not
+    # see is still created, with the fact read riding sudo exactly once.
+    host = CannedShellHost(
+        "", exit_status=2, stderr=PEER_AUTH_STDERR, elevated_stdout=DATABASES_OUTPUT
+    )
+    ctx, commands = await materialize(host, postgresql.database, database="shop")
+    assert ctx.changed
+    assert [cmd.shell() for cmd in commands] == [
+        "psql -Ac 'CREATE DATABASE \"shop\"'"
+    ]
+    shell = PostgresqlDatabases.command()
+    assert host.shells == [shell, f"sudo {shell}"]
 
 
 # --- operation helpers -------------------------------------------------------

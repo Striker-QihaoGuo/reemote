@@ -65,6 +65,16 @@ backed by a host-side `.pgpass`. The baseline's `psql_password` option (and the
 as is `postgresql.role`'s `password` parameter: credentials never travel
 through operation arguments, plans or logs.
 
+Fact reads ride the login user first; a read the server denies
+(`Peer authentication failed` / `no pg_hba.conf entry` — a peer-auth
+`pg_hba.conf` admits only the matching OS user) is re-read elevated with
+`sudo` (the `_MysqlFact._run` fallback precedent), so the facts stay
+idempotent under the same peer authentication the operations use. With
+`privilege.sudo_user = "postgres"` in the inventory this reproduces
+Ansible's `become_user: postgres` for reads. The run-as user and any
+password come from the inventory `privilege` data, never from an
+operation.
+
 ## Facts
 
 A fact is an asynchronous, queryable resource — never yielded by a
