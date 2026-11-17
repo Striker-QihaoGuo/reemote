@@ -41,7 +41,7 @@ a real asyncssh transport is missing:
   / ``firewalld_permanent_ipsets`` / ``firewalld_permanent_policies``
   / ``firewalld_permanent_zones`` / ``firewalld_policies``
   / ``firewalld_services`` / ``firewalld_status`` / ``firewalld_zones``
-  / ``flatpak_package_info`` / ``git_branches``
+  / ``fips_enabled`` / ``flatpak_package_info`` / ``git_branches``
   / ``git_configs`` / ``git_head_detached`` / ``git_local_commits``
   / ``git_remote_commits`` / ``git_remote_urls`` / ``git_repos``
   / ``git_ssh_authenticated`` / ``git_statuses`` / ``git_submodules``
@@ -105,7 +105,7 @@ a real asyncssh transport is missing:
   ``FirewalldZones``, ``FirewalldServices``, ``FirewalldIpSets``,
   ``FirewalldPolicies`` (the firewalld-local ``_FirewalldLockdown`` and
   ``_FirewalldPanicMode`` probes read the ``firewalld_lockdown`` and
-  ``firewalld_panic_mode`` seams), ``FlatpakPackage``, ``FlatpakPackages``,
+  ``firewalld_panic_mode`` seams), ``FipsEnabled``, ``FlatpakPackage``, ``FlatpakPackages``,
   ``GitBranch``, ``GitConfig``,
   ``GitHeadDetached``, ``GitIsRepo``, ``GitLocalCommit``,
   ``GitRemoteBranchCommit``, ``GitRemoteUrl``, ``GitSshKeyConfigured``,
@@ -1117,6 +1117,12 @@ class SimulatedHost(Host):
     # Whether panic mode is on, backing the private ``_FirewalldPanicMode``
     # probe the ``firewalld.panic`` operation compares against.
     firewalld_panic_mode: bool = False
+    # Whether the kernel is running in FIPS mode, backing ``FipsEnabled``.
+    # Defaults to False -- a simulated server boots with FIPS off, like a
+    # host whose /proc/sys/crypto/fips_enabled reads 0 (or is absent). A
+    # read-only seam: enabling FIPS is a boot-time kernel setting no
+    # operation changes, so a test simulating a FIPS host sets it directly.
+    fips_enabled: bool = False
     # Per-package flatpak identity (package name -> the ``FlatpakPackageInfo``
     # dict ``FlatpakPackage`` returns -- id, ref and version), backing
     # ``FlatpakPackage``. A name absent from the mapping reads as None, like an
